@@ -1,0 +1,7 @@
+[theme]
+base = "light"
+primaryColor = "#7FAF8A"
+backgroundColor = "#F4F8F4"
+secondaryBackgroundColor = "#E6F1E7"
+textColor = "#1F1E1A"
+font = "Space Grotesk"

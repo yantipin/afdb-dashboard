@@ -1,6 +1,7 @@
 import os
 import re
 import shlex
+from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
 
 import duckdb
@@ -34,10 +35,14 @@ EXCLUDED_HISTOGRAM_COLUMNS = {"modelEntityId", "uniprotAccession", "chunk"}
 CHUNK_DOWNLOAD_BASE_URL = (
     "https://ftp.ebi.ac.uk/pub/databases/alphafold/collaborations/nvda/models"
 )
+ALPHAFOLD_ENTRY_BASE_URL = "https://alphafold.ebi.ac.uk/entry"
+UNIPROT_ENTRY_BASE_URL = "https://www.uniprot.org/uniprotkb"
+PALE_BLUE_BAR_COLOR = "#AFC7E8"
 README_TXT_URL = (
     "https://huggingface.co/datasets/"
     "yantipin/afdb-complexes-metadata-19mil/resolve/main/README.txt"
 )
+SIDEBAR_LOGO_FILENAME = "af-cdd-logo.png"
 
 
 def quote_ident(identifier: str) -> str:
@@ -66,6 +71,24 @@ def chunk_to_download_url(chunk_value: Any) -> str | None:
     if not tar_name:
         return None
     return f"{CHUNK_DOWNLOAD_BASE_URL}/{tar_name}"
+
+
+def model_entity_to_alphafold_url(model_entity_id: Any) -> str | None:
+    if model_entity_id is None:
+        return None
+    cleaned = str(model_entity_id).strip()
+    if not cleaned:
+        return None
+    return f"{ALPHAFOLD_ENTRY_BASE_URL}/{cleaned}"
+
+
+def uniprot_accession_to_url(uniprot_accession: Any) -> str | None:
+    if uniprot_accession is None:
+        return None
+    cleaned = str(uniprot_accession).strip()
+    if not cleaned:
+        return None
+    return f"{UNIPROT_ENTRY_BASE_URL}/{cleaned}/entry"
 
 
 def build_wget_script(chunk_model_pairs: Sequence[Tuple[str, str]]) -> str:
@@ -348,6 +371,7 @@ def render_numeric_histogram(
         x="bin_center",
         y="count",
         labels={"bin_center": "Bin center", "count": "Count"},
+        color_discrete_sequence=[PALE_BLUE_BAR_COLOR],
     )
     fig.update_layout(title=f"Numeric distribution: {column}", height=340)
     st.plotly_chart(fig, width="stretch")
@@ -377,13 +401,30 @@ def render_categorical_histogram(
         st.info(f"No categories to plot for `{column}` with current filters.")
         return
 
-    fig = px.bar(df, x="category", y="count", labels={"category": column, "count": "Count"})
+    fig = px.bar(
+        df,
+        x="category",
+        y="count",
+        labels={"category": column, "count": "Count"},
+        color_discrete_sequence=[PALE_BLUE_BAR_COLOR],
+    )
     fig.update_layout(title=f"Categorical histogram: {column}", height=360)
     st.plotly_chart(fig, width="stretch")
 
 
 def main() -> None:
     st.set_page_config(page_title="AlphaFold Complexes Download Dashboard", layout="wide")
+    st.markdown(
+        """
+        <style>
+        @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap');
+        .stApp, .stApp * {
+            font-family: "Space Grotesk", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
     st.title("AlphaFold Complexes Download Dashboard")
     st.caption("Interactive dashboard powered by DuckDB over parquet on Hugging Face.")
     st.markdown(
@@ -398,6 +439,12 @@ def main() -> None:
     )
 
     with st.sidebar:
+        logo_path = Path(__file__).resolve().parent / SIDEBAR_LOGO_FILENAME
+        if logo_path.exists():
+            st.markdown("<div style='height: 0.75rem;'></div>", unsafe_allow_html=True)
+            _, logo_col, _ = st.columns([1, 2, 1])
+            with logo_col:
+                st.image(str(logo_path), width=140)
         st.header("Data source")
         user_url = st.text_input("Parquet URL", value=parquet_url)
         parquet_url = normalize_hf_url(user_url)
@@ -437,7 +484,12 @@ def main() -> None:
         categorical_filter_cols = st.multiselect(
             "Categorical filters",
             options=categorical_cols,
-            default=categorical_cols[: min(2, len(categorical_cols))],
+            default=[
+                col
+                for col in ["organismScientificName", "gene", "uniprotAccession"]
+                if col in categorical_cols
+            ]
+            or categorical_cols[: min(2, len(categorical_cols))],
         )
         categorical_filters: Dict[str, List[str]] = {}
         gene_text = ""
@@ -535,14 +587,32 @@ def main() -> None:
     chunk_model_pairs: List[Tuple[str, str]] = []
     if "chunk" in preview_df.columns:
         preview_df["chunk_download"] = preview_df["chunk"].map(chunk_to_download_url)
-        preferred_columns = ["chunk_download", "chunk"]
+        if "modelEntityId" in preview_df.columns:
+            preview_df["af_link"] = preview_df["modelEntityId"].map(model_entity_to_alphafold_url)
+        if "uniprotAccession" in preview_df.columns:
+            preview_df["uniprot_link"] = preview_df["uniprotAccession"].map(uniprot_accession_to_url)
+        preferred_columns = ["chunk_download", "chunk", "af_link"]
         ordered_columns = preferred_columns + [
             col for col in preview_df.columns if col not in set(preferred_columns)
         ]
+        if "modelEntityId" in ordered_columns and "uniprot_link" in ordered_columns:
+            ordered_columns.remove("uniprot_link")
+            model_id_idx = ordered_columns.index("modelEntityId")
+            ordered_columns.insert(model_id_idx + 1, "uniprot_link")
         preview_df = preview_df[ordered_columns]
         if "modelEntityId" in preview_df.columns:
+            all_pairs_sql = f"""
+            SELECT DISTINCT
+                CAST({quote_ident("chunk")} AS VARCHAR) AS chunk,
+                CAST({quote_ident("modelEntityId")} AS VARCHAR) AS modelEntityId
+            FROM {source}
+            {where_clause}
+            {"AND" if where_clause else "WHERE"} {quote_ident("chunk")} IS NOT NULL
+              AND {quote_ident("modelEntityId")} IS NOT NULL
+            """
+            all_pairs_df = execute_df(all_pairs_sql, where_params)
             seen_pairs: set[Tuple[str, str]] = set()
-            for row in preview_df[["chunk", "modelEntityId"]].itertuples(index=False):
+            for row in all_pairs_df[["chunk", "modelEntityId"]].itertuples(index=False):
                 tar_name = chunk_to_tar_name(row.chunk)
                 model_entity_id = str(row.modelEntityId).strip()
                 if not tar_name or not model_entity_id:
@@ -552,7 +622,7 @@ def main() -> None:
                     continue
                 seen_pairs.add(pair)
                 chunk_model_pairs.append(pair)
-            
+
             def chunk_sort_key(pair: Tuple[str, str]) -> Tuple[int, str, str]:
                 match = re.search(r"(\d+)", pair[0])
                 chunk_num = int(match.group(1)) if match else 10**9
@@ -566,7 +636,19 @@ def main() -> None:
                 "⬇",
                 help="Direct tar archive URL for this chunk",
                 display_text="⬇",
-            )
+            ),
+            "af_link": st.column_config.LinkColumn(
+                "AF",
+                help="Open AlphaFold entry for this model",
+                display_text="🧬",
+                width="small",
+            ),
+            "uniprot_link": st.column_config.LinkColumn(
+                "Uniprot",
+                help="Open UniProt entry for this accession",
+                display_text="🔗",
+                width="small",
+            ),
         }
 
     button_col, explanation_col = st.columns([1.2, 4], gap="small")
@@ -593,6 +675,29 @@ def main() -> None:
         )
 
     st.subheader("Filtered preview")
+    st.caption("AF column links to model pages on the AlphaFold website; not all models are available there.")
+    st.markdown(
+        """
+        <style>
+        [data-testid="stDataFrame"] table thead tr th:nth-child(3) div {
+            justify-content: center;
+        }
+        [data-testid="stDataFrame"] table thead tr th:nth-child(3),
+        [data-testid="stDataFrame"] table tbody tr td:nth-child(3) {
+            width: 2.5rem !important;
+            min-width: 2.5rem !important;
+            max-width: 2.5rem !important;
+            padding-left: 0.2rem !important;
+            padding-right: 0.2rem !important;
+        }
+        [data-testid="stDataFrame"] table tbody tr td:nth-child(3) a {
+            display: block;
+            text-align: center;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
     st.dataframe(
         preview_df,
         width="stretch",
