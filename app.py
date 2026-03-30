@@ -131,7 +131,7 @@ def build_wget_script(chunk_model_pairs: Sequence[Tuple[str, str]]) -> str:
             "    rc=$?",
             "    if [ ${rc} -ne 0 ]; then",
             '      echo "wget failed for ${url} (exit code: ${rc})"',
-            "      exit ${rc}",
+            "      continue",
             "    fi",
             "  else",
             '    echo "Chunk already downloaded: ${tar_path}"',
